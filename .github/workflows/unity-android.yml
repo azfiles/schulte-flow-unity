@@ -1,0 +1,133 @@
+name: Unity Android preview
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: unity-preview-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Test game rules
+        run: |
+          set -o pipefail
+          mkdir -p work/unity-build
+          bash scripts/test-unity-logic.sh | tee work/unity-build/model-report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unity-rules
+          path: work/unity-build/model-report.txt
+          if-no-files-found: error
+  license:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Unity activation inputs without exposing credentials
+        env:
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+        run: python3 scripts/check-unity-license.py
+  build:
+    needs: [rules, license]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reserve disk for the Unity Android image
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+      - name: Set preview version code
+        id: version
+        run: echo "code=$((20000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_OUTPUT"
+      - name: Compile Unity Android client
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00 # v4
+        env:
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+        with:
+          projectPath: unity
+          unityVersion: 6000.0.60f1
+          targetPlatform: Android
+          buildMethod: SchulteFlow.Editor.UnityBuild.Android
+          buildsPath: build/unity
+          buildName: Schulte-Flow-Unity-preview
+          versioning: Custom
+          version: 2.0.0-preview.1
+          androidVersionCode: ${{ steps.version.outputs.code }}
+          androidTargetSdkVersion: 35
+          chownFilesTo: 1001:1001
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'build-tools;35.0.0'
+      - name: Sign and verify preview package
+        run: |
+          mapfile -t apks < <(find build/unity -name '*.apk' -type f)
+          test "${#apks[@]}" -eq 1
+          bash scripts/package-unity-apk.sh "${apks[0]}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: unity-rules
+          path: build/unity-release
+      - name: Record release scope
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          Path('build/unity-release/README.txt').write_text(
+              '循光 Unity 预览版\n'
+              '已执行：C# 规则测试、Unity Android 构建、APK 包名/ABI/签名/对齐验证。\n'
+              '尚未执行：设备交互冒烟、实际画面与帧率、旧版数据迁移验证。\n'
+              '使用公开演示签名；预览包可与原生 v1 并存。\n'
+              'Commit: ' + os.environ['GITHUB_SHA'] + '\n', encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unity-preview-apk
+          path: build/unity-release/*
+          if-no-files-found: error
+      - name: Preserve available editor import logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-editor-logs
+          path: unity/Logs/**
+          if-no-files-found: ignore
+  publish:
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unity-preview-apk
+          path: release
+      - name: Publish Unity prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="unity-preview-r${GITHUB_RUN_NUMBER}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber
+          else
+            gh release create "$tag" release/* --target "$GITHUB_SHA" --prerelease \
+              --title "循光 Unity 第一版 · 预览 ${GITHUB_RUN_NUMBER}" --notes-file release/README.txt
+          fi

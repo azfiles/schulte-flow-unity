@@ -1,0 +1,6 @@
+{
+  "name": "SchulteFlow.Core",
+  "rootNamespace": "SchulteFlow.Core",
+  "autoReferenced": true,
+  "noEngineReferences": true
+}
